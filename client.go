@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -54,8 +55,8 @@ func NewClient(url string) *Client {
 }
 
 // find memes in backend by providing query
-func (c *Client) FindMeme(params string) (MemeResponse, error) {
-	resp, err := http.Get(c.url + "params=" + params) //TODO: specify url
+func (c *Client) FindMeme(params string, page string) (MemeResponse, error) {
+	resp, err := http.Get(c.url + "params=" + params + "page=" + page) //TODO: specify url
 	if err != nil {
 		return MemeResponse{}, fmt.Errorf("find meme: get resource: %w", err)
 	}
@@ -92,4 +93,23 @@ func (c *Client) GetMeme(id string) (VoiceMeme, error) {
 	}
 
 	return memeResp, nil
+}
+
+func (c *Client) AddMeme(m Meme) error {
+	body, err := json.Marshal(m)
+	if err != nil {
+		return fmt.Errorf("marshal body: %w", err)
+	}
+
+	resp, err := http.Post(c.url+"/", "application/json", bytes.NewBuffer(body))
+	if err != nil {
+		return fmt.Errorf("post request: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusCreated && resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("create meme error")
+	}
+
+	return nil
 }

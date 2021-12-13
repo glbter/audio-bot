@@ -1,19 +1,28 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api"
 	"log"
 	"os"
+	"strconv"
 	"strings"
+	"sync"
+	"time"
+)
+
+var (
+	fileCache map[int64]chan string
+	mu        sync.RWMutex
 )
 
 const (
 	memesOnPage = 9
 
-	prev  = "prev"
-	close = "close"
-	next  = "next"
+	prev = "prev"
+	clos = "clos"
+	next = "next"
 )
 
 const (
@@ -21,6 +30,7 @@ const (
 )
 
 func main() {
+	fileCache = make(map[int64]chan string)
 	client := NewClient(os.Getenv("API_MEME"))
 	bot, err := tgbotapi.NewBotAPI(os.Getenv("API_TOKEN"))
 	if err != nil {
@@ -41,21 +51,17 @@ func main() {
 
 		if upd.CallbackQuery != nil {
 			dt := upd.CallbackQuery.Data
-			if strings.Contains(dt, close) {
-				bot.DeleteMessage(
-					tgbotapi.NewDeleteMessage(
-						upd.CallbackQuery.Message.Chat.ID,
-						upd.CallbackQuery.Message.MessageID,
-					),
-				)
 
+			// clos the list with memes
+			if strings.Contains(dt, clos) {
+				deleteMemesList(bot, upd.CallbackQuery.Message)
 				continue
 			}
 
 			// go to the previous page
 			if strings.Contains(dt, prev) {
-				if strings.Split(dt, "|")[1] != "" {
-					// delete message and send new message
+				if page := strings.Split(dt, "|")[1]; page != "" {
+					moveToPage(upd, bot, client, page)
 					bot.AnswerCallbackQuery(tgbotapi.NewCallback(upd.CallbackQuery.ID, prev))
 					continue
 				}
@@ -65,7 +71,8 @@ func main() {
 
 			// go to the next page
 			if strings.Contains(dt, next) {
-				if strings.Split(dt, "|")[1] != "" {
+				if page := strings.Split(dt, "|")[1]; page != "" {
+					moveToPage(upd, bot, client, page)
 					bot.AnswerCallbackQuery(tgbotapi.NewCallback(upd.CallbackQuery.ID, next))
 					continue
 				}
@@ -80,114 +87,75 @@ func main() {
 			continue
 		}
 
-		//if upd.Message.Audio != nil {
-		//	chatId := upd.Message.Chat.ID
-		//	fileId := upd.Message.Audio.FileID
-		//	msg := tgbotapi.NewAudioShare(chatId, fileId)
-		//
-		//	msg.ReplyToMessageID = upd.Message.MessageID
-		//	if _, err := bot.Send(msg); err != nil {
-		//		log.Println("failed to send message ", msg)
-		//	}
-		//}
-
 		if upd.Message.Voice != nil {
 			chatId := upd.Message.Chat.ID
 			fileId := upd.Message.Voice.FileID
-			msg := tgbotapi.NewVoiceShare(chatId, fileId)
+			//msg := tgbotapi.NewVoiceShare(chatId, fileId)
+			msg := tgbotapi.NewMessage(chatId, "type a name for audio")
 
 			msg.ReplyToMessageID = upd.Message.MessageID
 			if _, err := bot.Send(msg); err != nil {
 				log.Println("failed to send message ", msg)
 			}
+
+			chName := make(chan string, 1)
+			mu.RLock()
+			fileCache[chatId] = chName
+			mu.RUnlock()
+
+			go func(chatId int64, fileId string) {
+				ctx, cancel := context.WithTimeout(context.Background(), 1*time.Minute)
+				defer cancel()
+
+				select {
+				case <-ctx.Done():
+					break
+				case memeName := <-chName:
+					err := client.AddMeme(Meme{Name: memeName, Id: fileId})
+					if err != nil {
+						msg := tgbotapi.NewMessage(chatId, "couldn't save your file")
+						if _, err := bot.Send(msg); err != nil {
+							log.Println("failed to send message ", msg)
+						}
+					}
+				}
+
+				mu.RLock()
+				delete(fileCache, chatId)
+				mu.RUnlock()
+			}(chatId, fileId)
 		}
 
-		if upd.Message.Text != "" {
+		if txt := upd.Message.Text; txt != "" {
+			mu.Lock()
+			chName, ok := fileCache[upd.Message.Chat.ID]
+			mu.Unlock()
+			// send meme to the server
+			if ok {
+				chName <- txt
+				continue
+			}
+
 			go func(message *tgbotapi.Message) {
-				resp, err := client.FindMeme(message.Text)
+				resp, err := client.FindMeme(message.Text, "1")
 
 				if err != nil {
 					// TODO: handle basing on error
 					log.Fatalf("failed: text <%v>, err: %v", message.Text, err)
 				}
 
-				msg := generateMemesResponse(resp, message.Chat.ID)
+				var nextPage string
+				if resp.Amount > memesOnPage {
+					nextPage = "2"
+				}
+
+				msg := generateMemesResponse(resp, message.Chat.ID, upd.Message.Text, "", nextPage)
 				if _, err := bot.Send(msg); err != nil {
 					log.Println("failed to send message ", msg)
 				}
 			}(upd.Message)
 		}
 	}
-}
-
-type Results struct {
-	Data []string
-	Prev string
-	Next string
-}
-
-func generateKeyboard(data Results) tgbotapi.InlineKeyboardMarkup {
-	rowLen := 3
-	row := make([]tgbotapi.InlineKeyboardButton, 0, rowLen)
-	board := make([][]tgbotapi.InlineKeyboardButton, 0, 3)
-
-	for i, x := range data.Data {
-		if i%rowLen == 0 {
-			board = append(board, row)
-			row = make([]tgbotapi.InlineKeyboardButton, 0, rowLen)
-		}
-
-		//tgbotapi.InlineK
-
-		elem := tgbotapi.NewInlineKeyboardButtonData(fmt.Sprintf("%v", i+1), x)
-		row = append(row, elem)
-	}
-
-	board = append(board, row)
-	board = append(
-		board,
-		tgbotapi.NewInlineKeyboardRow(
-			tgbotapi.NewInlineKeyboardButtonData("⏪", fmt.Sprintf("%v|%v", prev, data.Prev)),
-			tgbotapi.NewInlineKeyboardButtonData("⏹", close),
-			tgbotapi.NewInlineKeyboardButtonData("⏩", fmt.Sprintf("%v|%v", next, data.Next)),
-		),
-	)
-
-	return tgbotapi.NewInlineKeyboardMarkup(board...)
-}
-
-func generateList(data []string, page, allAmount int) string {
-	var builder strings.Builder
-	builder.WriteString(pageToAmount(page, allAmount) + "\n")
-	builder.WriteString("Memes \n")
-	builder.WriteString("\n")
-	for i, x := range data {
-		builder.WriteString(fmt.Sprintf("%v. %v \n", i+1, x))
-	}
-
-	return builder.String()
-}
-
-func pageToAmount(page, allAmount int) string {
-	right := page * memesOnPage
-	left := (page - 1) * memesOnPage
-	return fmt.Sprintf("%v-%v from %v", left, right, allAmount)
-}
-
-func generateMemesResponse(resp MemeResponse, chatId int64) tgbotapi.MessageConfig {
-	//stubNames := []string{"1","2","3","4","5","6","7","8","9"}
-	names := resp.Memes.ToNames()
-	txt := generateList(names, 1, resp.Amount)
-	msg := tgbotapi.NewMessage(chatId, txt)
-
-	ids := resp.Memes.ToIds()
-	msg.ReplyMarkup = generateKeyboard(Results{
-		Data: ids,
-		Prev: "",
-		Next: "",
-	})
-
-	return msg
 }
 
 func sendVoiceMeme(bot *tgbotapi.BotAPI, client *Client, message *tgbotapi.Message, data string) {
@@ -204,19 +172,45 @@ func sendVoiceMeme(bot *tgbotapi.BotAPI, client *Client, message *tgbotapi.Messa
 	}
 }
 
-//
-//func deleteList(bot *tgbotapi.BotAPI, dt string) error{
-//	data := strings.Split(dt, "|")
-//	chatId, err := strconv.ParseInt(data[2], 10, 10)
-//	if err != nil {
-//		return err
-//	}
-//
-//	msgId, err := strconv.Atoi(data[1])
-//	if err != nil {
-//		return err
-//	}
-//
-//	_, err = bot.DeleteMessage(tgbotapi.NewDeleteMessage(chatId, msgId))
-//	return err
-//}
+// clos the list with memes
+func deleteMemesList(bot *tgbotapi.BotAPI, message *tgbotapi.Message) {
+	bot.DeleteMessage(
+		tgbotapi.NewDeleteMessage(
+			message.Chat.ID,
+			message.MessageID,
+		),
+	)
+}
+
+func moveToPage(upd tgbotapi.Update, bot *tgbotapi.BotAPI, client *Client, page string) {
+	// delete message and send new message
+	text := upd.CallbackQuery.Message.Text
+	query := strings.Split(text, "\n")[0]
+	pageNum, err := strconv.Atoi(page)
+	if err != nil {
+		log.Fatalf("convert page to int: %v", err)
+	}
+
+	resp, err := client.FindMeme(query, page)
+
+	if err != nil {
+		// TODO: handle basing on error
+		log.Fatalf("failed: text <%v>, err: %v", query, err)
+	}
+
+	msg := generateMemesResponse(
+		resp,
+		upd.CallbackQuery.Message.Chat.ID,
+		upd.Message.Text,
+		fmt.Sprintf("%v", pageNum-1),
+		fmt.Sprintf("%v", pageNum+1),
+	)
+
+	deleteMemesList(bot, upd.CallbackQuery.Message)
+
+	if _, err := bot.Send(msg); err != nil {
+		log.Println("failed to send message ", msg)
+	}
+}
+
+//func saveMeme(bot *tgbotapi.BotAPI, client *Client, message *tgbotapi.Message, data string)
