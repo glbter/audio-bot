@@ -1,10 +1,15 @@
 package main
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api"
+	"io/ioutil"
 	"log"
+	"net/http"
+	"net/url"
 	"os"
 	"strconv"
 	"strings"
@@ -33,7 +38,7 @@ const (
 )
 
 func main() {
-	//fileCache = make(map[int64]chan string)
+	fileCache = make(map[int64]chan string)
 	memeApiUrl := os.Getenv("MEME_API")
 	if memeApiUrl == "" {
 		log.Fatal("get MEME_API: nil token")
@@ -131,6 +136,7 @@ func main() {
 					err := client.AddMeme(Meme{Name: memeName, Id: fileId})
 					if err != nil {
 						msg := tgbotapi.NewMessage(chatId, "couldn't save your file")
+						fmt.Println("send voice meme: ", err)
 						if _, err := bot.Send(msg); err != nil {
 							log.Println("failed to send message ", msg)
 						}
@@ -235,4 +241,213 @@ func moveToPage(upd tgbotapi.Update, bot *tgbotapi.BotAPI, client *Client, page 
 	}
 }
 
-//func saveMeme(bot *tgbotapi.BotAPI, client *Client, message *tgbotapi.Message, data string)
+
+type Client struct {
+	url string
+}
+
+type Meme struct {
+	Id   string `json:"id"`
+	Name string `json:"name"`
+}
+
+type Memes []Meme
+
+func (memes Memes) ToNames() []string {
+	names := make([]string, 0, len(memes))
+	for _, m := range memes {
+		names = append(names, m.Name)
+	}
+
+	return names
+}
+
+func (memes Memes) ToIds() []string {
+	names := make([]string, 0, len(memes))
+	for _, m := range memes {
+		names = append(names, m.Id)
+	}
+
+	return names
+}
+
+type MemeResponse struct {
+	Memes  Memes
+	Amount int
+}
+
+type VoiceMeme struct {
+	Id     string `json:"id"`
+	Name   string `json:"name"`
+	FileId string `json:"telegramFileId"`
+}
+
+// url + AudioFileController/
+func NewClient(url string) *Client {
+	return &Client{
+		url: url+"api/AudioFile/",
+	}
+}
+
+// find memes in backend by providing query
+func (c *Client) FindMeme(params string, page string) (MemeResponse, error) {
+	var memes Memes
+
+	take := 10
+	p, err := strconv.Atoi(page)
+	if err != nil {
+		return MemeResponse{}, fmt.Errorf("convert page to int: %w", err)
+	}
+	skip := (p - 1) * take
+
+	uri := fmt.Sprintf("%vGetByQuery?take=%v&query=%v&skip=%v", c.url, take, url.QueryEscape(params), skip)
+
+	fmt.Println(uri)
+
+	resp, err := http.Get(uri) //TODO: specify url
+	if err != nil {
+		return MemeResponse{}, fmt.Errorf("find meme: get resource: %w", err)
+	}
+
+	fmt.Println(resp)
+
+	defer resp.Body.Close()
+	body, err := ioutil.ReadAll(resp.Body)
+	if err != nil {
+		return MemeResponse{}, fmt.Errorf("find meme: read body: %w", err)
+	}
+
+	fmt.Println(body)
+
+	if err := json.Unmarshal(body, &memes); err != nil {
+		return MemeResponse{}, fmt.Errorf("find meme: unmarshal: %w", err)
+	}
+
+	res := MemeResponse{Memes: memes, Amount: len(memes)}
+	return res, nil
+}
+
+func (c *Client) GetMeme(id string) (VoiceMeme, error) {
+	fmt.Println(id)
+	fmt.Println(c.url + "GetById?id=" + id)
+	resp, err := http.Get(c.url + "GetById?id=" + id) //TODO: specify url
+	if err != nil {
+		return VoiceMeme{}, fmt.Errorf("get meme: get resource: %w", err)
+	}
+
+	defer resp.Body.Close()
+	body, err := ioutil.ReadAll(resp.Body)
+	if err != nil {
+		return VoiceMeme{}, fmt.Errorf("get meme: read body: %w", err)
+	}
+
+	var memeResp VoiceMeme
+	if err := json.Unmarshal(body, &memeResp); err != nil {
+		return VoiceMeme{}, fmt.Errorf("get meme: unmarshal: %w, %s", err, body)
+	}
+
+	return memeResp, nil
+}
+
+type NewMeme struct {
+	Id   string `json:"telegramFileId"`
+	Name string `json:"name"`
+}
+
+func (c *Client) AddMeme(m Meme) error {
+
+	meme := NewMeme{Id: m.Id, Name: m.Name}
+	body, err := json.Marshal(meme)
+	if err != nil {
+		return fmt.Errorf("marshal body: %w", err)
+	}
+
+	fmt.Println(m)
+	fmt.Println(body)
+	fmt.Println(c.url+"Create")
+
+	resp, err := http.Post(c.url+"Create", "application/json", bytes.NewBuffer(body))
+	if err != nil {
+		return fmt.Errorf("post request: %w", err)
+	}
+	defer resp.Body.Close()
+
+	fmt.Println(resp)
+
+	if resp.StatusCode != http.StatusCreated && resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("create meme error")
+	}
+
+	return nil
+}
+
+type Results struct {
+	Data []string
+	Prev string
+	Next string
+}
+
+func generateKeyboard(data Results) tgbotapi.InlineKeyboardMarkup {
+	rowLen := 3
+	row := make([]tgbotapi.InlineKeyboardButton, 0, rowLen)
+	board := make([][]tgbotapi.InlineKeyboardButton, 0, 3)
+
+	for i, x := range data.Data {
+		if i%rowLen == 0 {
+			board = append(board, row)
+			row = make([]tgbotapi.InlineKeyboardButton, 0, rowLen)
+		}
+
+		//tgbotapi.InlineK
+
+		elem := tgbotapi.NewInlineKeyboardButtonData(fmt.Sprintf("%v", i+1), x)
+		row = append(row, elem)
+	}
+
+	board = append(board, row)
+	board = append(
+		board,
+		tgbotapi.NewInlineKeyboardRow(
+			tgbotapi.NewInlineKeyboardButtonData("⏪", fmt.Sprintf("%v|%v", prev, data.Prev)),
+			tgbotapi.NewInlineKeyboardButtonData("⏹", clos),
+			tgbotapi.NewInlineKeyboardButtonData("⏩", fmt.Sprintf("%v|%v", next, data.Next)),
+		),
+	)
+
+	return tgbotapi.NewInlineKeyboardMarkup(board...)
+}
+
+func generateList(data []string, page, allAmount int) string {
+	var builder strings.Builder
+	builder.WriteString(pageToAmount(page, allAmount) + "\n")
+	builder.WriteString("Memes \n")
+	builder.WriteString("\n")
+	for i, x := range data {
+		builder.WriteString(fmt.Sprintf("%v. %v \n", i+1, x))
+	}
+
+	return builder.String()
+}
+
+func pageToAmount(page, allAmount int) string {
+	right := page * memesOnPage
+	left := (page - 1) * memesOnPage
+	return fmt.Sprintf("%v-%v from %v", left, right, allAmount)
+}
+
+func generateMemesResponse(resp MemeResponse, chatId int64, query, prevPage, nextPage string) tgbotapi.MessageConfig {
+	//stubNames := []string{"1","2","3","4","5","6","7","8","9"}
+	names := resp.Memes.ToNames()
+
+	txt := generateList(names, 1, resp.Amount)
+	msg := tgbotapi.NewMessage(chatId, query+"\n"+txt)
+
+	ids := resp.Memes.ToIds()
+	msg.ReplyMarkup = generateKeyboard(Results{
+		Data: ids,
+		Prev: prevPage,
+		Next: nextPage,
+	})
+
+	return msg
+}
